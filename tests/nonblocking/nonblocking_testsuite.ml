@@ -113,6 +113,8 @@ struct
     | `UInt64 i, `Int x | `Int x, `UInt64 i -> Unsigned.UInt64.(equal i (of_int x))
     | `UInt64 i, `Float x | `Float x, `UInt64 i -> Int64.to_float (Unsigned.UInt64.to_int64 i) = x
     | `UInt64 i, `Int64 x | `Int64 x, `UInt64 i -> Int64.equal (Unsigned.UInt64.to_int64 i) x
+    | `Int64 i, `Int64 i' -> Int64.equal i i'
+    | `UInt64 i, `UInt64 i' -> Unsigned.UInt64.equal i i'
     | `Int _, _ | _, `Int _ -> false
     | `Int64 _, _ | _, `Int64 _ -> false
     | `UInt64 _, _ | _, `UInt64 _ -> false

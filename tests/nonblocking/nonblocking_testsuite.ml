@@ -356,6 +356,50 @@ struct
     in
     (test_integer, test_bigint)
 
+  let test_unsigned_expression () =
+    connect () >>= or_die "connect" >>= fun dbh ->
+    M.prepare dbh
+      "CREATE TEMPORARY TABLE tmp_ids (id INT UNSIGNED NOT NULL DEFAULT '0')"
+    >>= or_die "prepare create"
+    >>= fun create_stmt ->
+    execute_no_data create_stmt >>= fun () ->
+    M.prepare dbh "INSERT INTO tmp_ids (id) VALUES (?)"
+    >>= or_die "prepare insert"
+    >>= fun insert_stmt ->
+    M.Stmt.execute insert_stmt [| `Int 42 |]
+    >>= or_die "insert"
+    >>= fun _ ->
+
+    M.prepare dbh "SELECT id AS id FROM tmp_ids"
+    >>= or_die "prepare select id"
+    >>= fun select_id_stmt ->
+    M.Stmt.execute select_id_stmt [||]
+    >>= or_die "execute select id"
+    >>= M.Res.fetch (module M.Row.Array)
+    >>= or_die "fetch select id"
+    >>= fun row1_opt ->
+    let value1 = match row1_opt with
+      | Some [| field |] -> M.Field.value field
+      | _ -> assert false
+    in
+
+    M.prepare dbh "SELECT id + 1 AS id FROM tmp_ids"
+    >>= or_die "prepare select id+1"
+    >>= fun select_expr_stmt ->
+    M.Stmt.execute select_expr_stmt [||]
+    >>= or_die "execute select id+1"
+    >>= M.Res.fetch (module M.Row.Array)
+    >>= or_die "fetch select id+1"
+    >>= fun row2_opt ->
+    let value2 = match row2_opt with
+      | Some [| field |] -> M.Field.value field
+      | _ -> assert false
+    in
+
+    assert_field_equal value1 (`Int 42);
+    assert_field_equal value2 (`Int 43);
+    M.close dbh
+
   let test_json () =
     connect () >>= or_die "connect" >>= fun dbh ->
 
@@ -451,5 +495,7 @@ struct
     test_txn () >>= fun () ->
     test_json () >>= fun () ->
     test_many_select () >>= fun () ->
-    test_integer () >>= fun () -> test_bigint ()
+    test_integer () >>= fun () ->
+    test_bigint () >>= fun () ->
+    test_unsigned_expression ()
 end

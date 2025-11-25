@@ -82,8 +82,8 @@ let convert field typ unsigned =
   | `Year,                _
   | `Tiny,             true -> `Int (int_of_char (cast_to char field))
   | `Tiny,            false -> `Int (cast_to schar field)
-  | `Short,            true -> `Int (cast_to int field)
-  | `Short,           false -> `Int (UInt.to_int (cast_to uint field))
+  | `Short,            true -> `Int (UInt.to_int (cast_to uint field))
+  | `Short,           false -> `Int (cast_to int field)
   | (`Int24 | `Long),  true -> `Int (UInt32.to_int (cast_to uint32_t field))
   | (`Int24 | `Long), false -> `Int (Int32.to_int (cast_to int32_t field))
   | `Long_long,        true -> `UInt64 (cast_to uint64_t field)

@@ -42,6 +42,14 @@ let mysql_fetch_field_direct res i =
 let mysql_stmt_bind_result stmt bind =
   B.mysql_stmt_bind_result stmt (to_voidp bind) = '\000'
 
+let mysql_stmt_fetch_column stmt bind column =
+  B.mysql_stmt_fetch_column
+    stmt
+    (to_voidp bind)
+    (Unsigned.UInt.of_int column)
+    Unsigned.ULong.zero
+  = 0
+
 let mysql_stmt_num_rows stmt =
   Unsigned.ULLong.to_int @@ B.mysql_stmt_num_rows stmt
 

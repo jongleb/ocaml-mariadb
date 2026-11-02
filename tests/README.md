@@ -8,6 +8,9 @@ latter there are instances depending on the concurrency library:
 | blocking            | Tests the blocking and nonblocking APIs without concurrency.
 | nonblocking-async   | Tests the nonblocking API using async.
 | nonblocking-lwt     | Tests the nonblocking API using Lwt.
+| streaming-unit     | Tests streaming configuration without a database.
+| streaming-lwt      | Tests bounded prepared-statement streaming using Lwt.
+| streaming-memory   | Measures buffered and streaming high-water RSS.
 
 Tests require access to a MariaDB or MySQL database, which must be declared
 by setting the following environment variables:
@@ -22,3 +25,11 @@ by setting the following environment variables:
 
 These tests will only run if `OCAML_MARIADB_DB` has been set, but the
 executable will still be built.  The remaining variables are optional.
+
+The memory executable accepts a mode, row count, and row size.  Run buffered
+and streaming modes as separate processes so `VmHWM` values are comparable:
+
+```
+dune exec tests/streaming-memory/streaming_memory.exe -- streaming 20000 8192
+dune exec tests/streaming-memory/streaming_memory.exe -- buffered 20000 8192
+```

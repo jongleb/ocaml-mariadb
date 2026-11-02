@@ -577,7 +577,7 @@ module type S = sig
   val sqlstate : t -> string
 end
 
-module Make (W : Wait) : S with type 'a future = 'a W.IO.future = struct
+module Make (W : Wait) = struct
   type t = mariadb
 
   type 'a future = 'a W.IO.future
@@ -698,6 +698,9 @@ module Make (W : Wait) : S with type 'a future = 'a W.IO.future = struct
           nonblocking' stmt.Common.Stmt.mariadb (Res.free res) >>= fun () ->
           nonblocking stmt.Common.Stmt.mariadb (Stmt.free_result stmt)
 
+    let reset_without_freeing stmt =
+      nonblocking stmt.Common.Stmt.mariadb (Stmt.reset stmt)
+
     let handle_execute = function
       | Ok stmt -> nonblocking stmt.Common.Stmt.mariadb (Stmt.store_result stmt)
       | Error _ as e -> return e
@@ -721,6 +724,491 @@ module Make (W : Wait) : S with type 'a future = 'a W.IO.future = struct
       | Error _ as e -> return e
 
     let sqlstate = Common.Stmt.sqlstate
+  end
+
+  module Streaming = struct
+    open Ctypes
+
+    module Config = struct
+      type t =
+        { max_field_bytes : int
+        ; max_row_bytes : int
+        }
+
+      type error =
+        | Non_positive_max_field_bytes of int
+        | Non_positive_max_row_bytes of int
+        | Field_limit_exceeds_row_limit of
+            { max_field_bytes : int
+            ; max_row_bytes : int
+            }
+
+      let unbuffered ~max_field_bytes ~max_row_bytes =
+        if max_field_bytes <= 0 then
+          Error (Non_positive_max_field_bytes max_field_bytes)
+        else if max_row_bytes <= 0 then
+          Error (Non_positive_max_row_bytes max_row_bytes)
+        else if max_field_bytes > max_row_bytes then
+          Error
+            (Field_limit_exceeds_row_limit
+               { max_field_bytes
+               ; max_row_bytes
+               })
+        else
+          Ok { max_field_bytes; max_row_bytes }
+    end
+
+    module Control = struct
+      type t =
+        | Continue
+        | Stop
+    end
+
+    module Completion = struct
+      type t =
+        | Exhausted of { rows_read : int }
+        | Stopped of { rows_read : int }
+    end
+
+    module Error = struct
+      type connector =
+        { code : int
+        ; message : string
+        ; sqlstate : string
+        }
+
+      type operation =
+        | Connector_failed of connector
+        | Connection_lost of connector
+        | No_result_set
+        | Parameter_count_mismatch of
+            { actual : int
+            ; expected : int
+            }
+        | Fixed_width_truncation of
+            { column : int
+            ; length : Unsigned.UInt64.t
+            ; buffer_bytes : int
+            }
+        | Field_limit_exceeded of
+            { column : int
+            ; length : Unsigned.UInt64.t
+            ; max_field_bytes : int
+            }
+        | Row_limit_exceeded of
+            { length : Unsigned.UInt64.t
+            ; max_row_bytes : int
+            }
+        | Callback_failed of exn
+        | Runtime_failed of exn
+
+      type t =
+        | Operation_failed of operation
+        | Cleanup_failed of
+            { operation : operation option
+            ; cleanup : connector
+            }
+    end
+
+    module type Lifecycle = sig
+      val catch :
+        (unit -> 'a future) ->
+        (exn -> 'a future) ->
+        'a future
+
+      val no_cancel : 'a future -> 'a future
+      val pause : unit -> unit future
+    end
+
+    module Make (L : Lifecycle) = struct
+      let execute
+          (type row)
+          ~config
+          (module R : Row.S with type t = row)
+          ~on_row
+          stmt
+          params =
+        let module Execution = struct
+          type fetch_outcome =
+            | Fetched_row
+            | End_of_result
+
+          type column_buffer =
+            | Fixed_width_buffer of int
+            | Variable_width_buffer of unit ptr
+
+          type bound_result =
+            { meta : Common.Res.meta
+            ; column_buffers : column_buffer array
+            ; scratch_bytes : int
+            }
+        end in
+        let open Execution in
+
+        let connector_snapshot (code, message) : Error.connector =
+          let code, message =
+            if code = 0 then
+              Common.error stmt.Common.Stmt.mariadb
+            else
+              code, message
+          in
+          { code
+          ; message
+          ; sqlstate = Common.Stmt.sqlstate stmt
+          }
+        in
+
+        let operation_error error =
+          match connector_snapshot error with
+          | { code = 2006 | 2013; _ } as connector ->
+              Error.Connection_lost connector
+          | connector -> Error.Connector_failed connector
+        in
+
+        let ( let* ) future continue =
+          future >>= function
+          | Ok value -> continue value
+          | Error operation -> return (Error operation)
+        in
+
+        let bind_parameters () =
+          let expected = stmt.Common.Stmt.num_params in
+          let actual = Array.length params in
+          if actual <> expected then
+            Error (Error.Parameter_count_mismatch { actual; expected })
+          else
+            match Common.Stmt.bind_params stmt params with
+            | `Ok _ -> Ok ()
+            | `Error error -> Error (operation_error error)
+        in
+
+        let cleanup () =
+          Stmt.free_meta_and_result stmt >>= fun released ->
+          Stmt.reset_without_freeing stmt >>= fun reset_result ->
+          match released, reset_result with
+          | Ok (), Ok () -> return (Ok ())
+          | Error error, _
+          | Ok (), Error error ->
+              return (Error (connector_snapshot error))
+        in
+
+        let nonblocking_stmt handle start cont =
+          nonblocking
+            stmt.Common.Stmt.mariadb
+            ( handle start
+            , fun status -> handle (cont (Status.to_int status)) )
+          >>= function
+          | Ok value -> return (Ok value)
+          | Error error -> return (Error (operation_error error))
+        in
+
+        let execute_statement () =
+          let handle = function
+            | 0, 0 -> `Ok ()
+            | 0, _ -> `Error (Common.Stmt.error stmt)
+            | status, _ -> `Wait (Status.of_int status)
+          in
+          nonblocking_stmt
+            handle
+            (B.mysql_stmt_execute_start stmt.Common.Stmt.raw)
+            (B.mysql_stmt_execute_cont stmt.Common.Stmt.raw)
+        in
+
+        let fetch () =
+          let handle = function
+            | 0, 0 -> `Ok Fetched_row
+            | 0, result when result = T.Return_code.data_truncated ->
+                `Ok Fetched_row
+            | 0, result when result = T.Return_code.no_data ->
+                `Ok End_of_result
+            | 0, _ -> `Error (Common.Stmt.error stmt)
+            | status, _ -> `Wait (Status.of_int status)
+          in
+          nonblocking_stmt
+            handle
+            (B.mysql_stmt_fetch_start stmt.Common.Stmt.raw)
+            (B.mysql_stmt_fetch_cont stmt.Common.Stmt.raw)
+        in
+
+        let bind_buffer result column buffer bytes =
+          let binding = !@(result.Bind.bind +@ column) in
+          result.Bind.buffers.(column) <- buffer;
+          setf binding T.Bind.buffer buffer;
+          setf
+            binding
+            T.Bind.buffer_length
+            (Unsigned.ULong.of_int bytes)
+        in
+
+        let bind_result () =
+          match B.mysql_stmt_result_metadata stmt.Common.Stmt.raw with
+          | None -> Error Error.No_result_set
+          | Some raw ->
+              let field_count = B.mysql_num_fields raw in
+              let bindings =
+                try Common.Stmt.alloc_result raw field_count
+                with exception_ ->
+                  B.mysql_free_result raw;
+                  raise exception_
+              in
+              stmt.Common.Stmt.meta <-
+                Some { res = raw; result = bindings };
+              let buffer_sizes =
+                Array.init field_count (fun column ->
+                    let binding = bindings.Bind.bind +@ column in
+                    let declared_type =
+                      getf (!@binding) T.Bind.buffer_type
+                    in
+                    let buffer_type =
+                      if
+                        declared_type = T.Type.year
+                        || declared_type = T.Type.short
+                      then begin
+                        setf (!@binding) T.Bind.buffer_type T.Type.long;
+                        T.Type.long
+                      end
+                      else
+                        declared_type
+                    in
+                    Common.Stmt.buffer_size buffer_type)
+              in
+              let variable_count =
+                Array.fold_left
+                  (fun count size ->
+                    if size < 0 then count + 1 else count)
+                  0
+                  buffer_sizes
+              in
+              let scratch_bytes =
+                if variable_count = 0 then
+                  0
+                else
+                  min
+                    (min 4096 config.Config.max_field_bytes)
+                    (max 1 (config.Config.max_row_bytes / variable_count))
+              in
+              let column_buffers =
+                Array.mapi
+                  (fun column size ->
+                    if size < 0 then
+                      let scratch_buffer =
+                        Common.Stmt.malloc scratch_bytes
+                      in
+                      bind_buffer
+                        bindings
+                        column
+                        scratch_buffer
+                        scratch_bytes;
+                      Variable_width_buffer scratch_buffer
+                    else begin
+                      bind_buffer
+                        bindings
+                        column
+                        (Common.Stmt.malloc size)
+                        size;
+                      Fixed_width_buffer size
+                    end)
+                  buffer_sizes
+              in
+              if B.mysql_stmt_bind_result stmt.Common.Stmt.raw bindings.Bind.bind
+              then
+                Ok
+                  { meta =
+                      Common.Res.meta bindings raw bindings.Bind.buffers
+                  ; column_buffers
+                  ; scratch_bytes
+                  }
+              else
+                Error (operation_error (Common.Stmt.error stmt))
+        in
+
+        let uint64_of_ulong length =
+          Unsigned.UInt64.of_int64 (Unsigned.ULong.to_int64 length)
+        in
+
+        let capture_runtime_failure work =
+          try work ()
+          with exception_ -> Error (Error.Runtime_failed exception_)
+        in
+
+        let max_field_length =
+          Unsigned.ULong.of_int config.Config.max_field_bytes
+        in
+
+        let fetch_truncated_columns bound =
+          let bindings = bound.meta.Common.Res.result in
+          let fields = bound.meta.Common.Res.fields in
+          let fetch_column column row_bytes =
+            if Field.null_value fields.(column) then
+              Ok row_bytes
+            else
+              let length = !@(bindings.Bind.length +@ column) in
+              if Unsigned.ULong.compare length max_field_length > 0 then
+                Error
+                  (Error.Field_limit_exceeded
+                     { column
+                     ; length = uint64_of_ulong length
+                     ; max_field_bytes = config.Config.max_field_bytes
+                     })
+              else
+                let length = Unsigned.ULong.to_int length in
+                if length > config.Config.max_row_bytes - row_bytes then
+                  Error
+                    (Error.Row_limit_exceeded
+                       { length =
+                           Unsigned.UInt64.add
+                             (Unsigned.UInt64.of_int row_bytes)
+                             (Unsigned.UInt64.of_int length)
+                       ; max_row_bytes = config.Config.max_row_bytes
+                       })
+                else
+                  let row_bytes = row_bytes + length in
+                  match bound.column_buffers.(column) with
+                  | Fixed_width_buffer buffer_bytes ->
+                      if length <= buffer_bytes then
+                        Ok row_bytes
+                      else
+                        Error
+                          (Error.Fixed_width_truncation
+                             { column
+                             ; length =
+                                 Unsigned.UInt64.of_int length
+                             ; buffer_bytes
+                             })
+                  | Variable_width_buffer _ ->
+                      if length <= bound.scratch_bytes then
+                        Ok row_bytes
+                      else
+                        let binding = bindings.Bind.bind +@ column in
+                        bind_buffer
+                          bindings
+                          column
+                          (Common.Stmt.malloc length)
+                          length;
+                        if
+                          B.mysql_stmt_fetch_column
+                            stmt.Common.Stmt.raw
+                            binding
+                            column
+                        then
+                          Ok row_bytes
+                        else
+                          Error (operation_error (Common.Stmt.error stmt))
+          in
+          let rec fetch_next column row_bytes =
+            if column = bindings.Bind.n then
+              Ok ()
+            else
+              match fetch_column column row_bytes with
+              | Error operation -> Error operation
+              | Ok row_bytes -> fetch_next (column + 1) row_bytes
+          in
+          fetch_next 0 0
+        in
+
+        let restore_scratch_buffers bound =
+          let bindings = bound.meta.Common.Res.result in
+          Array.iteri
+            (fun column -> function
+              | Fixed_width_buffer _ -> ()
+              | Variable_width_buffer scratch_buffer ->
+                  bind_buffer
+                    bindings
+                    column
+                    scratch_buffer
+                    bound.scratch_bytes)
+            bound.column_buffers
+        in
+
+        let invoke_callback row bound =
+          L.catch
+            (fun () -> on_row row >>= fun control -> return (Ok control))
+            (fun exception_ ->
+              return (Error (Error.Callback_failed exception_)))
+          >>= fun outcome ->
+          restore_scratch_buffers bound;
+          return outcome
+        in
+
+        let rec consume bound rows_read =
+          let* fetched = fetch () in
+          match fetched with
+          | End_of_result ->
+              return (Ok (Completion.Exhausted { rows_read }))
+          | Fetched_row ->
+              (match capture_runtime_failure (fun () ->
+                 match fetch_truncated_columns bound with
+                 | Error operation -> Error operation
+                 | Ok () ->
+                     let meta = bound.meta in
+                     Ok
+                       (R.build
+                          meta.Common.Res.result.Bind.n
+                          (fun column -> meta.Common.Res.fields.(column))))
+               with
+               | Error operation ->
+                   restore_scratch_buffers bound;
+                   return (Error operation)
+               | Ok row ->
+                   let* control = invoke_callback row bound in
+                   let rows_read = rows_read + 1 in
+                   (match control with
+                    | Control.Continue ->
+                        (if rows_read mod 256 = 0 then
+                           L.pause ()
+                         else
+                           return ())
+                        >>= fun () -> consume bound rows_read
+                    | Control.Stop ->
+                        return (Ok (Completion.Stopped { rows_read }))))
+        in
+
+        let cleanup_failed operation cleanup_error =
+          Error
+            (Error.Cleanup_failed
+               { operation
+               ; cleanup = cleanup_error
+               })
+        in
+
+        let finish operation cleanup_result =
+          match operation, cleanup_result with
+          | Ok completion, Ok () -> Ok completion
+          | Error operation, Ok () ->
+              Error (Error.Operation_failed operation)
+          | Ok _, Error cleanup_error ->
+              cleanup_failed None cleanup_error
+          | Error operation, Error cleanup_error ->
+              cleanup_failed (Some operation) cleanup_error
+        in
+
+        let run () =
+          cleanup () >>= function
+          | Error cleanup_error ->
+              return (cleanup_failed None cleanup_error)
+          | Ok () ->
+              let operation =
+                let* () =
+                  return (capture_runtime_failure bind_parameters)
+                in
+                let* () = execute_statement () in
+                let* bound =
+                  return (capture_runtime_failure bind_result)
+                in
+                consume bound 0
+              in
+              operation >>= fun operation ->
+              cleanup () >>= fun cleanup_result ->
+              return (finish operation cleanup_result)
+        in
+
+        L.no_cancel
+          (L.catch run (fun exception_ ->
+             return
+               (Error
+                  (Error.Operation_failed
+                     (Error.Runtime_failed exception_)))))
+    end
   end
 
   let connect ?host ?user ?pass ?db ?(port=0) ?socket ?(flags=[]) ?(options=[]) () =

@@ -278,6 +278,9 @@ module Functions (F : Ctypes.FOREIGN) = struct
   let mysql_stmt_bind_result = foreign "mysql_stmt_bind_result"
     (stmt @-> ptr void @-> returning my_bool)
 
+  let mysql_stmt_fetch_column = foreign "mysql_stmt_fetch_column"
+    (stmt @-> ptr void @-> uint @-> ulong @-> returning int)
+
   let mysql_stmt_num_rows = foreign "mysql_stmt_num_rows"
     (stmt @-> returning ullong)
 

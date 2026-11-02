@@ -583,5 +583,98 @@ module Nonblocking : sig
 
   (** Functor that generates a nonblocking database interface, given a
       nonblocking IO monad and a way to wait for connection socket events. *)
-  module Make (W : Wait) : S with type 'a future := 'a W.IO.future
+  module Make (W : Wait) : sig
+    include S with type 'a future := 'a W.IO.future
+
+    module Streaming : sig
+      module Config : sig
+        type t
+
+        type error =
+          | Non_positive_max_field_bytes of int
+          | Non_positive_max_row_bytes of int
+          | Field_limit_exceeds_row_limit of
+              { max_field_bytes : int
+              ; max_row_bytes : int
+              }
+
+        val unbuffered :
+          max_field_bytes:int ->
+          max_row_bytes:int ->
+          (t, error) Stdlib.result
+      end
+
+      module Control : sig
+        type t =
+          | Continue
+          | Stop
+      end
+
+      module Completion : sig
+        type t =
+          | Exhausted of { rows_read : int }
+          | Stopped of { rows_read : int }
+      end
+
+      module Error : sig
+        type connector =
+          { code : int
+          ; message : string
+          ; sqlstate : string
+          }
+
+        type operation =
+          | Connector_failed of connector
+          | Connection_lost of connector
+          | No_result_set
+          | Parameter_count_mismatch of
+              { actual : int
+              ; expected : int
+              }
+          | Fixed_width_truncation of
+              { column : int
+              ; length : Unsigned.UInt64.t
+              ; buffer_bytes : int
+              }
+          | Field_limit_exceeded of
+              { column : int
+              ; length : Unsigned.UInt64.t
+              ; max_field_bytes : int
+              }
+          | Row_limit_exceeded of
+              { length : Unsigned.UInt64.t
+              ; max_row_bytes : int
+              }
+          | Callback_failed of exn
+          | Runtime_failed of exn
+
+        type t =
+          | Operation_failed of operation
+          | Cleanup_failed of
+              { operation : operation option
+              ; cleanup : connector
+              }
+      end
+
+      module type Lifecycle = sig
+        val catch :
+          (unit -> 'a W.IO.future) ->
+          (exn -> 'a W.IO.future) ->
+          'a W.IO.future
+
+        val no_cancel : 'a W.IO.future -> 'a W.IO.future
+        val pause : unit -> unit W.IO.future
+      end
+
+      module Make (_ : Lifecycle) : sig
+        val execute :
+          config:Config.t ->
+          (module Row.S with type t = 'row) ->
+          on_row:('row -> Control.t W.IO.future) ->
+          Stmt.t ->
+          Field.value array ->
+          (Completion.t, Error.t) Stdlib.result W.IO.future
+      end
+    end
+  end
 end

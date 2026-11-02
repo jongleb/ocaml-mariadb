@@ -1,0 +1,3 @@
+(executable
+ (name streaming_memory)
+ (libraries mariadb lwt lwt.unix))
